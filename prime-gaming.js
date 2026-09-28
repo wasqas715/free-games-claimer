@@ -591,9 +591,34 @@ try {
   // https://github.com/vogler/free-games-claimer/issues/55
   if (cfg.pg_claimdlc) {
     console.log('Trying to claim in-game content...');
-    await page.click('button[data-type="InGameLoot"]');
-    const loot = page.locator('div[data-a-target="offer-list-IN_GAME_LOOT"]');
-    await loot.waitFor();
+    // The in-game-loot entry point was a Twitch-era attribute. Probe tolerant shapes and never block
+    // on a blind click: a missing nav used to cost 60s and then abort the whole DLC block.
+    const dlcNavSels = [
+      'button[data-type="InGameLoot"]',
+      'button:has-text("In-game content")',
+      'button:has-text("In-game loot")',
+      '[role="tab"]:has-text("In-game")',
+      'a:has-text("In-game content")',
+    ];
+    let dlcNav = null;
+    for (const sel of dlcNavSels) {
+      const cand = page.locator(sel).first();
+      if (await cand.count() && await cand.isVisible().catch(_ => false)) { dlcNav = cand; console.log('  in-game section matched:', sel); break; }
+    }
+    if (!dlcNav) {
+      console.log('  no in-game content section present - skipping the DLC phase (nothing to collect, or the nav was renamed)');
+      const seen = await page.locator('button, [role="tab"], a').evaluateAll(els => els
+        .filter(e => e.offsetParent !== null)
+        .map(e => `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''} :: ${(e.innerText || '').trim().slice(0, 40)}`)
+        .filter(s => /in-game|ingame|loot|content|offer/i.test(s)).slice(0, 20));
+      console.log('  candidate nav controls:', seen);
+    } else {
+      await dlcNav.click({ timeout: 15000 });
+    }
+    const loot = page.locator('div[data-a-target="offer-list-IN_GAME_LOOT"], [data-a-target*="IN_GAME_LOOT"], [data-testid*="in-game-loot"]');
+    if (dlcNav) {
+      try { await loot.first().waitFor({ timeout: 15000 }); } catch (_) { console.log('  in-game loot list did not appear; continuing with what is on the page'); }
+    }
 
     process.stdout.write('Loading all DLCs on page...');
     await scrollUntilStable(() => loot.locator('[data-a-target="item-card"]').count())
@@ -617,15 +642,27 @@ try {
       if (cfg.debug) await page.pause();
       if (cfg.dryrun) continue;
       if (cfg.interactive && !await confirm()) continue;
-      db.data[user][title] ||= { title, time: datetime(), store: 'DLC', status: 'failed: need account linking' };
+      db.data[user][title] ||= { title, time: datetime(), store: 'DLC', status: 'pending' };
       const notify_game = { title, url };
       notify_games.push(notify_game); // status is updated below
       try {
         await page.goto(url, { waitUntil: 'domcontentloaded' });
         // most games have a button 'Get in-game content'
         // epic-games: Fall Guys: Claim -> Continue -> Go to Epic Games (despite account linked and logged into epic-games) -> not tied to account but via some cookie?
-        await Promise.any([page.click('.tw-button:has-text("Get in-game content")'), page.click('.tw-button:has-text("Claim your gift")'), page.click('.tw-button:has-text("Claim")').then(() => page.click('button:has-text("Continue")'))]);
-        page.click('button:has-text("Continue")').catch(_ => { });
+        let dlcClicked = false;
+        for (const sel of ['button:has-text("Get in-game content")', 'button:has-text("Claim your gift")', 'button:has-text("Claim")', '.tw-button:has-text("Get in-game content")', '.tw-button:has-text("Claim your gift")', '.tw-button:has-text("Claim")']) {
+          const cand = page.locator(sel).first();
+          if (await cand.count() && await cand.isVisible().catch(_ => false)) { await cand.click({ timeout: 15000 }).catch(_ => { }); dlcClicked = true; console.log('  dlc claim clicked:', sel); break; }
+        }
+        if (!dlcClicked) {
+          const seen = await page.locator('button, [role="button"], a').evaluateAll(els => els
+            .filter(e => e.offsetParent !== null)
+            .map(e => `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''} :: ${(e.innerText || '').trim().slice(0, 40)}`)
+            .slice(0, 12));
+          console.log('  dlc claim: no claim control found; visible controls:', seen);
+        } else {
+          page.click('button:has-text("Continue")', { timeout: 8000 }).catch(_ => { });
+        }
         const linkAccountButton = page.locator('[data-a-target="LinkAccountButton"]');
         let unlinked_store;
         if (await linkAccountButton.count()) {
@@ -653,7 +690,10 @@ try {
         console.error(error);
       } finally {
         await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded' });
-        await page.click('button[data-type="InGameLoot"]');
+    for (const sel of dlcNavSels) {
+      const cand = page.locator(sel).first();
+      if (await cand.count() && await cand.isVisible().catch(_ => false)) { await cand.click({ timeout: 15000 }).catch(_ => { }); break; }
+    }
       }
     }
     console.log('DLC: Unlinked accounts:', dlc_unlinked);
