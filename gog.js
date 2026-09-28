@@ -43,9 +43,46 @@ try {
   await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded' }); // default 'load' takes forever
 
   // page.click('#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll').catch(_ => { }); // does not work reliably, solved by setting CookieConsent above
-  const signIn = page.locator('a:has-text("Sign in")').first();
-  await Promise.any([signIn.waitFor(), page.waitForSelector('#menuUsername')]);
-  while (await signIn.isVisible()) {
+  // The GOG header was rebuilt (menu-v3): sign-in is now a <button class="menu-v3__button">SIGN IN</button>
+  // and #menuUsername no longer exists, so racing the two legacy selectors rejects and kills the run.
+  const signInSels = [
+    'button.menu-v3__button:has-text("SIGN IN")',
+    'button.menu-v3__button:has-text("Sign in")',
+    'a:has-text("Sign in")',
+    'button:has-text("Sign in")',
+    'a:has-text("SIGN IN")',
+  ];
+  const signedInSels = [
+    '#menuUsername',
+    '[class*="menu"] [class*="avatar"]',
+    '[class*="menu__avatar"]',
+    '[class*="menu"] a[href*="/account"]',
+  ];
+  const findVisible = async sels => {
+    for (const sel of sels) {
+      const c = page.locator(sel).first();
+      if (await c.count() && await c.isVisible().catch(_ => false)) return { sel, loc: c };
+    }
+    return null;
+  };
+  let signIn = null;
+  for (let i = 0; i < 20; i++) {
+    const si = await findVisible(signInSels);
+    const li = await findVisible(signedInSels);
+    if (li && !si) { console.log('  gog session detected via', li.sel); break; }
+    if (si) { signIn = si.loc; console.error('Not signed in anymore.'); console.log('  gog sign-in control matched:', si.sel); break; }
+    await page.waitForTimeout(1000);
+  }
+  if (!signIn && !await findVisible(signedInSels)) {
+    const seen = await page.locator('header a, header button, [class*="menu"] a, [class*="menu"] button').evaluateAll(els => els
+      .filter(e => e.offsetParent !== null)
+      .map(e => e.tagName.toLowerCase() + (typeof e.className === 'string' && e.className.trim() ? '.' + e.className.trim().split(/\s+/).slice(0, 2).join('.') : '') + ' :: ' + (e.innerText || '').trim().slice(0, 30))
+      .slice(0, 25));
+    console.error('  gog: could not determine sign-in state. url=' + page.url());
+    console.error('  header controls:', seen);
+    notify('gog: could not determine sign-in state - see log');
+  }
+  while (signIn && await signIn.isVisible()) {
     console.error('Not signed in anymore.');
     await signIn.click();
     // it then creates an iframe for the login
@@ -78,7 +115,11 @@ try {
         notify('gog: got captcha during login. Please check.');
         // TODO solve reCAPTCHA?
       }).catch(_ => { });
-      await page.waitForSelector('#menuUsername');
+      try {
+        await page.waitForSelector('#menuUsername', { timeout: 20000 });
+      } catch (_) {
+        if (!await findVisible(signedInSels)) console.log('  gog: post-login marker unclear; continuing');
+      }
     } else {
       console.log('Waiting for you to login in the browser.');
       await notify('gog: no longer signed in and not enough options set for automatic login.');
