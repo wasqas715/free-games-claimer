@@ -52,110 +52,14 @@ try {
     const email = cfg.pg_email || await prompt({ message: 'Enter email' });
     const password = email && (cfg.pg_password || await prompt({ type: 'password', message: 'Enter password' }));
     if (email && password) {
-      // PATCHED v5: visibility-gated sign-in (email via fill(), password via keystrokes), email logged.
-      const VIS_EMAIL = ['#ap_email:visible', 'input[name=email]:visible', 'input[type=email]:visible'];
-      const VIS_PW = ['#ap_password:visible', 'input[name=password]:visible', 'input[type=password]:visible'];
-      const probe = async (tag) => {
-        const d = await page.evaluate(() => {
-          const describe = (sel) => [...document.querySelectorAll(sel)].slice(0, 20)
-            .map(e => `${e.tagName}${e.id ? '#' + e.id : ''}[name=${e.name || '-'}][type=${e.type || '-'}]${e.offsetParent ? '' : '(hidden)'}`).join(', ');
-          const pw = document.querySelector('#ap_password:not([hidden]), input[name=password], input[type=password]');
-          const em = document.querySelector('#ap_email, input[name=email], input[type=email]');
-          const pwVis = [...document.querySelectorAll('input[type=password]')].some(e => !!e.offsetParent);
-          return {
-            url: location.href.slice(0, 110),
-            forms: document.forms.length,
-            inputs: describe('input'),
-            submits: describe('input[type=submit], button, [role=button]'),
-            emailValue: em ? em.value : null,
-            pwExists: !!pw, pwVisible: pwVis, pwFilled: pw ? (pw.value.length > 0) : null,
-            captcha: !!document.querySelector('iframe[src*=captcha], .g-recaptcha, [id*=captcha], img[src*=captcha]'),
-          };
-        }).catch(_ => 'probe failed');
-        console.error(`PRIME PROBE ${tag}: ${JSON.stringify(d)}`);
-        return d;
-      };
-      const setField = async (selectors, value, label, useKeys) => {
-        for (const s of selectors) {
-          const loc = page.locator(s).first();
-          if (!(await loc.count().catch(_ => 0))) continue;
-          if (!(await loc.isVisible().catch(_ => false))) continue;
-          await loc.click({ timeout: 15000 }).catch(_ => { });
-          if (useKeys) {
-            await loc.fill('', { timeout: 5000 }).catch(_ => { });
-            await loc.type(value, { delay: 40, timeout: 120000 }).catch(async () => { await loc.fill(value, { timeout: 15000 }).catch(_ => { }); });
-          } else {
-            await loc.fill(value, { timeout: 15000 }).catch(async () => { await loc.type(value, { delay: 40, timeout: 120000 }).catch(_ => { }); });
-          }
-          const got = await loc.inputValue().catch(_ => null);
-          console.log(`  ${label}: set via ${s}; field length now ${got === null ? '?' : got.length}`);
-          if (got !== null) return s;
-        }
-        console.error(`  ${label}: no VISIBLE field accepted the value`);
-        return null;
-      };
-      const submitAny = async (label) => {
-        const cascade = ['#continue', '#signInSubmit', 'input[type="submit"]:visible', 'button:has-text("Sign in")', 'button:has-text("Continue")', 'input[type="submit"]'];
-        for (const s of cascade) {
-          const loc = page.locator(s).first();
-          if (!(await loc.count().catch(_ => 0))) continue;
-          const ok = await loc.click({ timeout: 15000 }).then(() => true).catch(_ => false);
-          if (ok) { console.log(`  ${label}: clicked ${s}`); return s; }
-        }
-        console.error(`  ${label}: no submit control clicked`);
-        return null;
-      };
-      const waitVisiblePw = async (ms) => {
-        const deadline = Date.now() + ms;
-        while (Date.now() < deadline) {
-          for (const s of VIS_PW) {
-            const loc = page.locator(s).first();
-            if (await loc.count().catch(_ => 0) && await loc.isVisible().catch(_ => false)) return loc;
-          }
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-        return null;
-      };
-      await probe('start');
-      await setField(VIS_EMAIL, email, 'email', false);
-      const preEmail = await probe('before-continue');
-      await submitAny('continue');
-      const pwLoc = await waitVisiblePw(30000);
-      if (!pwLoc) {
-        console.error('  no VISIBLE password field appeared within 30s of submitting the email');
-        await probe('no-password-page');
-      } else {
-        console.log('  password page reached (visible password field found)');
-        await setField(VIS_PW, password, 'password', true);
-        const pre = await probe('before-password-submit');
-        if (pre && pre.pwFilled === false) await setField(VIS_PW, password, 'password(refill)', true);
-        await pwLoc.press('Enter', { timeout: 15000 }).catch(_ => { });
-        console.log('  submit: pressed Enter inside the visible password field');
-        await new Promise((r) => setTimeout(r, 10000));
-        const after = await probe('after-password-submit');
-        if (after && after.pwVisible) {
-          console.log('still on a visible password field 10s after Enter — trying the button cascade');
-          await submitAny('password-fallback');
-          await probe('after-password-fallback');
-        }
-      }
-      // PATCHED v6: never let a background watcher's rejection kill the run.
-      process.on('unhandledRejection', (reason) => {
-        console.error('  unhandled rejection (continuing):', reason && reason.message ? String(reason.message).split('\n')[0] : String(reason));
-      });
+      await page.fill('[name=email]', email);
+      await page.click('input[type="submit"]');
+      await page.fill('[name=password]', password);
+      // await page.check('[name=rememberMe]'); // no longer exists
+      await page.click('input[type="submit"]');
       page.waitForURL('**/ap/signin**').then(async () => { // check for wrong credentials
-        let error = '';
-        const alertCount = await page.locator('.a-alert-content').count().catch(_ => 0);
-        if (alertCount) error = await page.locator('.a-alert-content').first().innerText().catch(_ => '');
-        // FIXED: was `if (!error.trim.length) return;` — `.length` was read off the trim function,
-        // always 0, so this always returned early and every credential error went unreported.
-        if (!error.trim().length) {
-          // No alert box: dump what the page actually shows so a captcha/challenge is identifiable
-          // from the log instead of looking like a silent hang.
-          const shown = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 400)).catch(_ => '?');
-          console.error('Sign-in page has no alert box. Page shows:', shown);
-          return;
-        }
+        const error = await page.locator('.a-alert-content').first().innerText();
+        if (!error.trim.length) return;
         console.error('Login error:', error);
         await notify(`prime-gaming: login: ${error}`);
         await context.close(); // finishes potential recording
@@ -178,36 +82,7 @@ try {
         process.exit(1);
       }
     }
-    // PATCHED: Amazon's return path drifts (na.account.amazon.com/ap/sso round trip) and does not
-    // always come back with the exact query string the old code required. Accept the drifted shapes,
-    // log each URL change, and fail fast with the stuck URL instead of 30 silent minutes.
-    {
-      const landedOk = (u) => !/\/ap\/|\/login|\/errors\//.test(u) &&
-        (/gaming\.amazon\.com\/home/.test(u) || /luna\.amazon\.com\/(claims\/home|home)/.test(u));
-      const budgetMs = Math.min(cfg.login_timeout, 300000);
-      const deadline = Date.now() + budgetMs;
-      let landed = null, lastUrl = '', same = 0;
-      while (Date.now() < deadline) {
-        const u = page.url();
-        if (u !== lastUrl) { same = 0; console.log(`post-login url: ${u}`); lastUrl = u; }
-        else if (++same % 60 === 0) console.log(`still waiting on: ${u}`);
-        if (landedOk(u)) { landed = u; break; }
-        const dropdown = await page.locator('[data-a-target="user-dropdown-first-name-text"]').count().catch(_ => 0);
-        if (dropdown) { landed = u; break; }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-      if (landed) {
-        console.log(`Login complete, landed on ${landed}`);
-      } else {
-        const title = await page.title().catch(_ => '?');
-        const shown = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 300)).catch(_ => '?');
-        console.error(`Login did NOT complete within ${Math.round(budgetMs / 1000)}s. Stuck on: ${lastUrl} (title: ${title})`);
-        console.error('Page shows:', shown);
-        await notify(`prime-gaming: login stalled on ${lastUrl}`);
-        await context.close();
-        process.exit(1);
-      }
-    }
+    await page.waitForURL('https://gaming.amazon.com/home?signedIn=true');
     if (!cfg.debug) context.setDefaultTimeout(cfg.timeout);
   }
   user = await page.locator('[data-a-target="user-dropdown-first-name-text"]').first().innerText();
@@ -305,141 +180,41 @@ try {
   }
   // external_info = [ { title: 'Fallout 76 (XBOX)', url: 'https://gaming.amazon.com/fallout-76-xbox-fgwp/dp/amzn1.pg.item.9fe17d7b-b6c2-4f58-b494-cc4e79528d0b?ingress=amzn&ref_=SM_Fallout76XBOX_S01_FGWP_CRWN' } ];
   for (const { title, url } of external_info) {
-    try { // PATCHED v8: per-offer isolation
     console.log('Current free game:', chalk.blue(title)); // , url);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     if (cfg.debug) await page.pause();
-    // PATCHED v6: Prime Gaming no longer renders the Twitch-era DescriptionItemDetails node.
-    let item_text = '';
-    try {
-      item_text = await page.innerText('[data-a-target="DescriptionItemDetails"]', { timeout: 8000 });
-    } catch (_) {
-      item_text = await page.locator('text=/[Aa]vailable on /').first().innerText({ timeout: 5000 }).catch(() => '');
-      if (!item_text) console.log('  (no description node - inferring the external store from the offer URL)');
-    }
-    // PATCHED v7: the offer URL slug is authoritative; page text is boilerplate. The mapped values
-    // MUST match the app's redeem map keys exactly ('gog.com', 'microsoft store', 'legacy games'),
-    // otherwise the code capture below never runs for that store.
-    const SLUG_STORE = {
-      gog: 'gog.com',
-      epic: 'epic games store',
-      'legacy-games': 'legacy games',
-      legacy: 'legacy games',
-      microsoft: 'microsoft store',
-      xbox: 'microsoft store',
-      ea: 'ea',
-      origin: 'origin',
-      ubisoft: 'ubisoft',
-      rockstar: 'rockstar',
-      blizzard: 'blizzard',
-    };
-    const slugKey = (url.toLowerCase().match(/-(gog|epic|legacy-games|legacy|microsoft|xbox|ea|origin|ubisoft|rockstar|blizzard)(?:$|[/?])/) || [])[1] || '';
-    // PATCHED v9: keep BOTH store signals. They disagreed in each direction on live offers, and
-    // whichever one is a key store is the one that carries a code.
-    const pageTextStore = (((item_text || '').trim().toLowerCase().replace(/\s+/g, ' ').match(/on ([a-z0-9 ._'-]+)$/) || [])[1] || '').replace(/[\s.]+$/, '');
-    let store = SLUG_STORE[slugKey] || '';
-    if (store) {
-      console.log(`  External store: ${store} (from offer URL slug: -${slugKey})`);
-      if (pageTextStore && pageTextStore !== store) {
-        console.log(`  store disagreement: page text says "${pageTextStore}" - both are tested against the redeem map`);
-      }
-    } else {
-      store = pageTextStore || 'unknown';
-      console.log(`  External store: ${store} (no store slug in the URL; read from page text)`);
-    }
+    const item_text = await page.innerText('[data-a-target="DescriptionItemDetails"]');
+    const store = item_text.toLowerCase().replace(/.* on /, '').slice(0, -1);
     console.log('  External store:', store);
     if (cfg.pg_timeLeft && await skipBasedOnTime(url)) continue;
     if (cfg.dryrun) continue;
     if (cfg.interactive && !await confirm()) continue;
-    // PATCHED v6: modern claim cascade; a failure skips this game instead of killing the run.
-    const claimSelectors = [
-      '[data-a-target="buy-box"] .tw-button:has-text("Get game")',
-      '[data-a-target="buy-box"] .tw-button:has-text("Claim")',
-      '.tw-button:has-text("Complete Claim")',
-      'button:has-text("Get game")',
-      'button:has-text("Claim")',
-      'button:has-text("Redeem")',
-      'a:has-text("Claim")',
-    ];
-    try {
-      // PATCHED v8: tag the winning condition so the log says what actually happened.
-      const claimOutcome = await Promise.any([
-        ...claimSelectors.map((s) => page.locator(s).first().click({ timeout: 20000 }).then(() => `clicked ${s}`)),
-        // PATCHED v10: the real Luna claim-page marker (probe-verified). The old guesses never
-        // matched this page, so each burned its full timeout and reported a false negative.
-        page.waitForSelector('text=/Success, you received a code to redeem/i', { timeout: 25000 }).then(() => 'page says: Success, you received a code to redeem'),
-        page.waitForSelector('text=/Collected on/i', { timeout: 25000 }).then(() => 'page shows Collected on <date>'),
-        page.waitForSelector('.thank-you-title:has-text("Success")').then(() => 'page shows Success'),
-        page.waitForSelector('div:has-text("Link game account")').then(() => 'page shows a link-account prompt'),
-      ]);
-      console.log('  claim:', claimOutcome);
-    } catch (claimErr) {
-      const seen = await page.evaluate(() => [...document.querySelectorAll('button, a, [role=button]')]
-        .filter((e) => e.offsetParent)
-        .slice(0, 40)
-        .map((e) => `${e.tagName}${e.getAttribute('data-a-target') ? '[data-a-target=' + e.getAttribute('data-a-target') + ']' : ''}: ${(e.innerText || '').trim().slice(0, 40)}`)
-        .join(' | ')).catch(() => 'dump failed');
-      console.error('  claim: no control responded -', String(claimErr && claimErr.message).split('\n')[0]);
-      console.error('  claim: visible controls on', page.url(), '->', seen);
-      continue;
-    }
+    await Promise.any([page.click('[data-a-target="buy-box"] .tw-button:has-text("Get game")'), page.click('[data-a-target="buy-box"] .tw-button:has-text("Claim")'), page.click('.tw-button:has-text("Complete Claim")'), page.waitForSelector('div:has-text("Link game account")'), page.waitForSelector('.thank-you-title:has-text("Success")')]); // waits for navigation
     db.data[user][title] ||= { title, time: datetime(), url, store };
     const notify_game = { title, url };
     notify_games.push(notify_game); // status is updated below
-    // PATCHED v7: the original gate aborted the whole claim on ANY div containing the words
-    // "Link account" and skipped the code/redeem block below - key-bearing offers (microsoft, gog,
-    // legacy games) silently lost their codes that way. The old else-body now runs unconditionally.
-    const linkingControl = await page.locator(
-      'button:has-text("Link account"), a:has-text("Link account"), [data-a-target*="LinkAccount"]'
-    ).count();
-    if (linkingControl) {
-      console.error('  NOTE: an account-linking control is present on this offer page -');
-      console.error('  v7 continues anyway so a key store still yields its code.');
-      notify_game.status = `needs account linking? for ${store}`;
-    }
-    {
-      // PATCHED v10: status comes from the page's own marker, not an inference. This inference is
-      // what made the app record genuinely claimed offers as "failed: need account linking".
-      const claimConfirmed = await page.evaluate(() => /Success, you received a code to redeem|Collected on/i.test(document.body ? document.body.innerText : '')).catch(() => false);
-      db.data[user][title].status = claimConfirmed ? 'claimed' : (linkingControl ? 'claimed? (linking control present)' : 'claimed (unconfirmed)');
+    if (await page.locator('div:has-text("Link game account")').count() // TODO still needed? epic games store just has 'Link account' as the button text now.
+       || await page.locator('div:has-text("Link account")').count()) {
+      console.error('  Account linking is required to claim this offer!');
+      notify_game.status = `failed: need account linking for ${store}`;
+      db.data[user][title].status = 'failed: need account linking';
+      // await page.pause();
+      // await page.click('[data-a-target="LinkAccountModal"] [data-a-target="LinkAccountButton"]');
+      // TODO login for epic games also needed if already logged in
+      // wait for https://www.epicgames.com/id/authorize?redirect_uri=https%3A%2F%2Fservice.link.amazon.gg...
+      // await page.click('button[aria-label="Allow"]');
+    } else {
+      db.data[user][title].status = 'claimed';
       // print code if there is one
       const redeem = {
         // 'origin': 'https://www.origin.com/redeem', // TODO still needed or now only via account linking?
         'gog.com': 'https://www.gog.com/redeem',
-        gog: 'https://www.gog.com/redeem',
         'microsoft store': 'https://account.microsoft.com/billing/redeem',
         xbox: 'https://account.microsoft.com/billing/redeem',
         'legacy games': 'https://www.legacygames.com/primedeal',
       };
-      // PATCHED v9: accept either store signal, so a misleading slug cannot cost a code.
-      if (!(store in redeem) && pageTextStore && pageTextStore in redeem) {
-        console.log(`  using page-text store "${pageTextStore}" instead of slug store "${store}" for the redeem map`);
-        store = pageTextStore;
-      }
       if (store in redeem) { // did not work for linked origin: && !await page.locator('div:has-text("Successfully Claimed")').count()
-        // PATCHED v9: the claim response renders a moment after the click. Without this settle the
-        // code capture read an empty page (v8: "none on the page"); with it the GOG keys came through.
-        await new Promise((r) => setTimeout(r, 4000));
-        let code = '';
-        try {
-          code = await Promise.any([
-            page.inputValue('input[type="text"]', { timeout: 15000 }),
-            page.textContent('[data-a-target="ClaimStateClaimCodeContent"]', { timeout: 15000 }).then((s) => s.replace('Your code: ', '')),
-          ]);
-        } catch (codeErr) {
-          // v9 fallback: the Twitch-era code element is gone, so scan the page text for a code shape.
-          const found = await page.evaluate(() => {
-            const body = document.body ? document.body.innerText : '';
-            return (body.match(/\b[A-Z0-9]{4,6}(?:-[A-Z0-9]{4,6}){2,5}\b|\b[A-Z0-9]{16}\b/g) || []).slice(0, 3);
-          }).catch(() => []);
-          if (found && found.length) {
-            code = found[0];
-            console.log('  Code to redeem game: ' + code + ' (recovered by scanning the page text)');
-          } else {
-            console.error('  Code to redeem game: none on the page - already claimed, or this offer carries no key. Continuing.');
-            continue;
-          }
-        }
+        const code = await Promise.any([page.inputValue('input[type="text"]'), page.textContent('[data-a-target="ClaimStateClaimCodeContent"]').then(s => s.replace('Your code: ', ''))]); // input: Legacy Games; text: gog.com
         console.log('  Code to redeem game:', chalk.blue(code));
         if (store == 'legacy games') { // may be different URL like https://legacygames.com/primeday/puzzleoftheyear/
           redeem[store] = await (await page.$('li:has-text("Click here") a')).getAttribute('href'); // full text: Click here to enter your redemption code.
@@ -570,11 +345,6 @@ try {
       // console.info('  Saved a screenshot of page to', p);
     }
     // await page.pause();
-    } catch (offerErr) {
-      // PATCHED v8: one bad offer must never end the sweep (v7: offer #1 ended all remaining work).
-      console.error('  offer failed, continuing with the next one:', String((offerErr && offerErr.message) || offerErr).split('\n')[0]);
-      continue;
-    }
   }
   await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded' });
   await page.click('button[data-type="Game"]');
