@@ -129,38 +129,64 @@ try {
         process.exit(1);
       }
     }
-    await page.waitForSelector('#menuUsername');
+    try {
+      await page.waitForSelector('#menuUsername', { timeout: 20000 });
+    } catch (_) {
+      if (!await findVisible(signedInSels)) console.log('  gog: sign-in state unclear after manual login; continuing');
+    }
     if (!cfg.debug) context.setDefaultTimeout(cfg.timeout);
   }
-  user = await page.locator('#menuUsername').first().textContent(); // innerText is uppercase due to styling!
+  // innerText was uppercase due to styling; the marker itself is gone from the rebuilt header.
+  const plausibleUser = s => !!s && /^[A-Za-z0-9_.@-]{2,40}$/.test(s.trim());
+  user = await page.locator('#menuUsername').first().textContent().catch(_ => undefined);
+  if (!plausibleUser(user)) {
+    // Prefer an identity already in the db: never invent a key (the old marker once returned the whole
+    // menu text and created a junk entry beside the real username).
+    const known = Object.keys(db.data).filter(plausibleUser);
+    const cand = await findVisible(signedInSels.filter(s => s !== '#menuUsername'));
+    const candText = cand ? ((await cand.loc.textContent().catch(_ => '')) || '').trim() : '';
+    user = known[0] || (plausibleUser(candText) ? candText.trim() : 'gog');
+    console.log('  gog username marker is gone; continuing as identity:', user);
+  }
+  user = user.trim();
   console.log(`Signed in as ${user}`);
   db.data[user] ||= {};
 
+  // The #giveaway banner is legacy markup: modern GOG renders none, and the banner used to gate the
+  // entire claim, so a missing banner silently skipped claiming forever. The banner now only names the
+  // giveaway for the db/notify/screenshot; the auto-claim URL is always visited.
   const banner = page.locator('#giveaway');
-  if (!await banner.count()) {
-    console.log('Currently no free giveaway!');
-  } else {
-    const text = await page.locator('.giveaway__content-header').innerText();
+  let title;
+  let giveawayUrl;
+  if (await banner.count()) {
+    const text = await page.locator('.giveaway__content-header').innerText().catch(_ => '');
     const match_all = text.match(/Claim (.*) and don't miss the|Success! (.*) was added to/);
-    const title = match_all[1] ? match_all[1] : match_all[2];
-    const url = await banner.locator('a').first().getAttribute('href');
-    console.log(`Current free game: ${chalk.blue(title)} - ${url}`);
-    db.data[user][title] ||= { title, time: datetime(), url };
-    if (cfg.dryrun) process.exit(1);
+    if (match_all && (match_all[1] || match_all[2])) title = match_all[1] ? match_all[1] : match_all[2];
+    title ||= 'unknown giveaway';
+    giveawayUrl = await banner.locator('a').first().getAttribute('href').catch(_ => undefined);
+    console.log(`Current free game: ${chalk.blue(title)} - ${giveawayUrl}`);
     // await page.locator('#giveaway:not(.is-loading)').waitFor(); // otherwise screenshot is sometimes with loading indicator instead of game title; #TODO fix, skipped due to timeout, see #240
-    await banner.screenshot({ path: screenshot(`${filenamify(title)}.png`) }); // overwrites every time - only keep first?
+    await banner.screenshot({ path: screenshot(`${filenamify(title)}.png`) }).catch(_ => { }); // overwrites every time - only keep first?
+  } else {
+    console.log('No #giveaway banner on the storefront (modern markup) - claiming via the auto-claim URL anyway.');
+  }
+  // A dated key keeps distinct giveaways apart when the banner cannot name them.
+  title ||= `GOG giveaway ${new Date().toISOString().slice(0, 10)}`;
+  giveawayUrl ||= 'https://www.gog.com/giveaway';
+  db.data[user][title] ||= { title, time: datetime(), url: giveawayUrl };
+  if (cfg.dryrun) process.exit(1);
 
-    // await banner.getByRole('button', { name: 'Add to library' }).click();
-    // instead of clicking the button, we visit the auto-claim URL which gives as a JSON response which is easier than checking the state of a button
-    await page.goto('https://www.gog.com/giveaway/claim');
-    const response = await page.innerText('body');
-    // console.log(response);
-    // {} // when successfully claimed
-    // {"message":"Already claimed"}
-    // {"message":"Unauthorized"}
-    // {"message":"Giveaway has ended"}
-    let status;
-    if (response == '{}') {
+  // instead of clicking the button, we visit the auto-claim URL which gives a JSON response which is easier than checking the state of a button
+  await page.goto('https://www.gog.com/giveaway/claim');
+  const response = await page.innerText('body');
+  // console.log(response);
+  // {} // when successfully claimed
+  // {"message":"Already claimed"}
+  // {"message":"Unauthorized"}
+  // {"message":"Giveaway has ended"}
+  let status;
+  try {
+    if (response.trim() == '{}') {
       status = 'claimed';
       console.log('  Claimed successfully!');
     } else {
@@ -173,14 +199,22 @@ try {
         status = message;
       }
     }
-    db.data[user][title].status ||= status;
-    notify_games.push({ title, url, status });
+  } catch (e) {
+    // a redirect or an HTML error page is not JSON - report it instead of dying
+    console.log('  unexpected auto-claim response:', response.trim().slice(0, 200));
+    status = 'unknown';
+  }
+  db.data[user][title].status ||= status;
+  notify_games.push({ title, url: giveawayUrl, status });
 
-    if (status == 'claimed' && !cfg.gog_newsletter) {
-      console.log('Unsubscribe from \'Promotions and hot deals\' newsletter');
+  if (status == 'claimed' && !cfg.gog_newsletter) {
+    try {
+      console.log("Unsubscribe from 'Promotions and hot deals' newsletter");
       await page.goto('https://www.gog.com/en/account/settings/subscriptions');
-      await page.locator('li:has-text("Marketing communications through Trusted Partners") label').uncheck();
-      await page.locator('li:has-text("Promotions and hot deals") label').uncheck();
+      await page.locator('li:has-text("Marketing communications through Trusted Partners") label').uncheck({ timeout: 15000 });
+      await page.locator('li:has-text("Promotions and hot deals") label').uncheck({ timeout: 15000 });
+    } catch (e) {
+      console.log('  newsletter unsubscribe skipped:', (e.message || e).toString());
     }
   }
 } catch (error) {
